@@ -1,4 +1,3 @@
-
 #include <array>
 #include <cerrno>
 #include <cctype>
@@ -10,15 +9,19 @@
 #include <getopt.h>
 #include <iomanip>
 #include <iostream>
-#include <curl/curl.h>
 #include <linux/i2c-dev.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
 #include <vector>
+#include <csignal>
+#include <curl/curl.h>
+#include <ctime>
 
 namespace {
 
@@ -61,6 +64,146 @@ enum class EncoderType {
     Pira32,
 };
 
+const std::vector<std::pair<uint8_t, const char*>> PTY_LIST = {
+    {0,  "No programme type or undefined"},
+    {1,  "News"},
+    {2,  "Current Affairs"},
+    {3,  "Information"},
+    {4,  "Sport"},
+    {5,  "Education"},
+    {6,  "Drama"},
+    {7,  "Culture"},
+    {8,  "Science"},
+    {9,  "Varied"},
+    {10, "Pop Music"},
+    {11, "Rock Music"},
+    {12, "Easy Listening Music"},
+    {13, "Light Classical"},
+    {14, "Serious Classical"},
+    {15, "Other Music"},
+    {16, "Weather"},
+    {17, "Finance"},
+    {18, "Children's Programmes"},
+    {19, "Social Affairs"},
+    {20, "Religion"},
+    {21, "Phone In"},
+    {22, "Travel"},
+    {23, "Leisure"},
+    {24, "Jazz Music"},
+    {25, "Country Music"},
+    {26, "National Music"},
+    {27, "Oldies Music"},
+    {28, "Folk Music"},
+    {29, "Documentary"},
+    {30, "Alarm Test"},
+    {31, "Alarm"},
+};
+
+volatile sig_atomic_t g_stopRequested = 0;
+std::string g_pidfilePath;
+
+void handleSignal(int) {
+    g_stopRequested = 1;
+}
+
+void removePidfile() {
+    if (!g_pidfilePath.empty()) {
+        ::unlink(g_pidfilePath.c_str());
+    }
+}
+
+void writePidfile(const std::string& path) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        throw std::runtime_error("Cannot write pidfile " + path + ": " + std::strerror(errno));
+    }
+    std::string pid = std::to_string(static_cast<long>(::getpid())) + "\n";
+    if (::write(fd, pid.data(), pid.size()) != static_cast<ssize_t>(pid.size())) {
+        int e = errno;
+        ::close(fd);
+        throw std::runtime_error("Cannot write pidfile " + path + ": " + std::strerror(e));
+    }
+    ::close(fd);
+    g_pidfilePath = path;
+    std::atexit(removePidfile);
+}
+
+void installSignalHandlers() {
+    struct sigaction sa{};
+    sa.sa_handler = handleSignal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
+    sigaction(SIGHUP, &sa, nullptr);
+}
+
+void redirectStandardFds(const std::string& logfile) {
+    int nullFd = ::open("/dev/null", O_RDWR);
+    if (nullFd < 0) {
+        throw std::runtime_error("Cannot open /dev/null: " + std::string(std::strerror(errno)));
+    }
+    if (::dup2(nullFd, STDIN_FILENO) < 0) {
+        int e = errno;
+        ::close(nullFd);
+        throw std::runtime_error("dup2 stdin failed: " + std::string(std::strerror(e)));
+    }
+
+    int outFd = nullFd;
+    if (!logfile.empty()) {
+        outFd = ::open(logfile.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (outFd < 0) {
+            int e = errno;
+            ::close(nullFd);
+            throw std::runtime_error("Cannot open logfile " + logfile + ": " + std::strerror(e));
+        }
+    }
+
+    if (::dup2(outFd, STDOUT_FILENO) < 0 || ::dup2(outFd, STDERR_FILENO) < 0) {
+        int e = errno;
+        if (outFd != nullFd) ::close(outFd);
+        ::close(nullFd);
+        throw std::runtime_error("dup2 stdout/stderr failed: " + std::string(std::strerror(e)));
+    }
+
+    if (outFd != nullFd) ::close(outFd);
+    ::close(nullFd);
+}
+
+void daemonizeProcess(const std::string& pidfile, const std::string& logfile) {
+    pid_t pid = ::fork();
+    if (pid < 0) {
+        throw std::runtime_error("fork failed: " + std::string(std::strerror(errno)));
+    }
+    if (pid > 0) {
+        std::exit(0);
+    }
+
+    if (::setsid() < 0) {
+        throw std::runtime_error("setsid failed: " + std::string(std::strerror(errno)));
+    }
+
+    pid = ::fork();
+    if (pid < 0) {
+        throw std::runtime_error("second fork failed: " + std::string(std::strerror(errno)));
+    }
+    if (pid > 0) {
+        std::exit(0);
+    }
+
+    ::umask(022);
+    if (::chdir("/") != 0) {
+        throw std::runtime_error("chdir(/) failed: " + std::string(std::strerror(errno)));
+    }
+
+    redirectStandardFds(logfile);
+    installSignalHandlers();
+
+    if (!pidfile.empty()) {
+        writePidfile(pidfile);
+    }
+}
+
 [[noreturn]] void die(const std::string& msg) {
     throw std::runtime_error(msg);
 }
@@ -89,6 +232,45 @@ std::string trim(const std::string& s) {
         --end;
     }
     return s.substr(start, end - start);
+}
+
+std::string normalizePtyName(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (char ch : s) {
+        unsigned char u = static_cast<unsigned char>(ch);
+        if (std::isalnum(u)) out.push_back(static_cast<char>(std::tolower(u)));
+        else if (std::isspace(u) || ch == '-' || ch == '_' || ch == '/' || ch == '&' || ch == '\'' ) out.push_back(' ');
+    }
+    std::string collapsed;
+    bool lastSpace = true;
+    for (char ch : out) {
+        if (ch == ' ') {
+            if (!lastSpace) collapsed.push_back(ch);
+            lastSpace = true;
+        } else {
+            collapsed.push_back(ch);
+            lastSpace = false;
+        }
+    }
+    return trim(collapsed);
+}
+
+uint8_t parsePtyName(const std::string& s) {
+    std::string want = normalizePtyName(s);
+    if (want.empty()) die("PTY name must not be empty");
+    for (const auto& item : PTY_LIST) {
+        if (normalizePtyName(item.second) == want) return item.first;
+    }
+    die("Unknown PTY name: " + s);
+}
+
+void printPtyList() {
+    std::cout << "PTY list:\n\n";
+    for (const auto& item : PTY_LIST) {
+        std::cout << std::setw(2) << static_cast<int>(item.first) << "\t" << item.second << "\n";
+    }
+    std::cout << "\n";
 }
 
 long parseLong(const std::string& s, const std::string& what) {
@@ -333,13 +515,19 @@ struct Config {
 
     bool verify = true;
     bool quiet = false;
-    bool hasRtUrl = false;   std::string rtUrl;
-    int intervalSec = 5;
-    int urlTimeoutSec = 10;
+    bool daemonize = false;
+    bool foreground = true;
+    std::string pidfile;
+    std::string logfile;
+    std::string rtUrl;
+    int interval = 5;
+    int urlTimeout = 5;
+    bool hasRtUrl = false;
 
     bool hasPi = false;      uint16_t pi = 0;
     bool hasPs = false;      std::string ps;
     bool hasPty = false;     uint8_t pty = 0;
+    bool wantPtyList = false;
     bool hasDi = false;      uint8_t di = 0;
     bool hasMs = false;      uint8_t ms = 0;
     bool hasTp = false;      uint8_t tp = 0;
@@ -378,7 +566,9 @@ void usage(const char* prog) {
         << "Common metadata:\n"
         << "  --pi HEX            PI code, exactly 4 hex digits\n"
         << "  --ps TEXT           PS name, max 8 chars, padded with spaces\n"
-        << "  --pty N             PTY 0..31\n"
+        << "  --pty N|list        PTY 0..31 or print PTY list\n"
+        << "  --pty-name NAME     Set PTY by name, e.g. \"Rock Music\"\n"
+        << "  --list              Print PTY list and exit\n"
         << "  --di N              DI 0..15\n"
         << "  --ms 0|1            Music/Speech\n"
         << "  --tp 0|1            Traffic Program\n"
@@ -386,9 +576,6 @@ void usage(const char* prog) {
         << "  --af LIST           AF list, comma-separated MHz or raw codes\n"
         << "  --clear-af          Clear AF list\n"
         << "  --rt TEXT           Radiotext (MRDS1322 max 64, PIRA32 RT1 max 64)\n"
-        << "  --rt-url URL        Poll plain-text URL and update RT on change\n"
-        << "  --interval N        Poll interval in seconds for --rt-url (default: 5)\n"
-        << "  --url-timeout N     HTTP timeout in seconds for --rt-url (default: 10)\n"
         << "  --rt-enable 0|1     RT enable (MRDS1322: bit; PIRA32: RT1EN)\n"
         << "  --rt-ab 0|1         RT A/B flag (MRDS1322 only)\n"
         << "  --dps TEXT          Dynamic PS (MRDS1322 max 80, PIRA32 DPS1 up to 255)\n"
@@ -406,6 +593,13 @@ void usage(const char* prog) {
         << "  --store-eeprom      Store current settings into EEPROM\n\n"
         << "Behavior:\n"
         << "  --no-verify         Disable readback verification where possible\n"
+        << "  --daemon            Run in background\n"
+        << "  --foreground        Stay in foreground (default)\n"
+        << "  --pidfile FILE      Write daemon PID to file\n"
+        << "  --logfile FILE      Redirect stdout/stderr to logfile in daemon mode\n"
+        << "  --rt-url URL        Poll plain-text URL and send changes as RT\n"
+        << "  --interval N        Poll interval in seconds for --rt-url (default: 5)\n"
+        << "  --url-timeout N     HTTP timeout in seconds for --rt-url (default: 5)\n"
         << "  -q, --quiet         Less verbose output\n"
         << "  -h, --help          Show this help\n\n"
         << "Examples:\n"
@@ -423,7 +617,9 @@ Config parseArgs(int argc, char* argv[]) {
         {"addr", required_argument, nullptr, 'a'},
         {"pi", required_argument, nullptr, 1000},
         {"ps", required_argument, nullptr, 1001},
-        {"pty", required_argument, nullptr, 1002},
+{"pty", required_argument, nullptr, 1002},
+        {"pty-name", required_argument, nullptr, 1029},
+        {"list", no_argument, nullptr, 1030},
         {"di", required_argument, nullptr, 1003},
         {"ms", required_argument, nullptr, 1004},
         {"tp", required_argument, nullptr, 1005},
@@ -431,9 +627,6 @@ Config parseArgs(int argc, char* argv[]) {
         {"af", required_argument, nullptr, 1007},
         {"clear-af", no_argument, nullptr, 1008},
         {"rt", required_argument, nullptr, 1009},
-        {"rt-url", required_argument, nullptr, 1026},
-        {"interval", required_argument, nullptr, 1027},
-        {"url-timeout", required_argument, nullptr, 1028},
         {"rt-enable", required_argument, nullptr, 1010},
         {"rt-ab", required_argument, nullptr, 1011},
         {"dps", required_argument, nullptr, 1012},
@@ -450,6 +643,13 @@ Config parseArgs(int argc, char* argv[]) {
         {"reset", no_argument, nullptr, 1023},
         {"store-eeprom", no_argument, nullptr, 1024},
         {"no-verify", no_argument, nullptr, 1025},
+        {"daemon", no_argument, nullptr, 1026},
+        {"foreground", no_argument, nullptr, 1027},
+        {"pidfile", required_argument, nullptr, 1028},
+        {"rt-url", required_argument, nullptr, 1032},
+        {"interval", required_argument, nullptr, 1033},
+        {"url-timeout", required_argument, nullptr, 1034},
+        {"logfile", required_argument, nullptr, 1031},
         {"quiet", no_argument, nullptr, 'q'},
         {"help", no_argument, nullptr, 'h'},
         {nullptr, 0, nullptr, 0}
@@ -482,7 +682,27 @@ Config parseArgs(int argc, char* argv[]) {
             }
             case 1000: cfg.pi = parseHex16Code(optarg, "PI"); cfg.hasPi = true; break;
             case 1001: cfg.ps = padOrTrim(optarg, MAX_PS_LENGTH); cfg.hasPs = true; break;
-            case 1002: { long v = parseLong(optarg, "PTY"); if (v < 0 || v > 31) die("PTY must be 0..31"); cfg.pty = static_cast<uint8_t>(v); cfg.hasPty = true; break; }
+            case 1002: {
+                std::string v = trim(optarg);
+                std::string vl = v;
+                for (char& ch : vl) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+                if (vl == "list") {
+                    cfg.wantPtyList = true;
+                    break;
+                }
+                long n = parseLong(v, "PTY");
+                if (n < 0 || n > 31) die("PTY must be 0..31");
+                cfg.pty = static_cast<uint8_t>(n);
+                cfg.hasPty = true;
+                break;
+            }
+            case 1029:
+                cfg.pty = parsePtyName(optarg);
+                cfg.hasPty = true;
+                break;
+            case 1030:
+                cfg.wantPtyList = true;
+                break;
             case 1003: { long v = parseLong(optarg, "DI"); if (v < 0 || v > 15) die("DI must be 0..15"); cfg.di = static_cast<uint8_t>(v); cfg.hasDi = true; break; }
             case 1004: { long v = parseLong(optarg, "MS"); if (v < 0 || v > 1) die("MS must be 0 or 1"); cfg.ms = static_cast<uint8_t>(v); cfg.hasMs = true; break; }
             case 1005: { long v = parseLong(optarg, "TP"); if (v < 0 || v > 1) die("TP must be 0 or 1"); cfg.tp = static_cast<uint8_t>(v); cfg.hasTp = true; break; }
@@ -495,9 +715,6 @@ Config parseArgs(int argc, char* argv[]) {
             }
             case 1008: cfg.clearAf = true; break;
             case 1009: cfg.rt = optarg; cfg.hasRt = true; break;
-            case 1026: cfg.rtUrl = optarg; cfg.hasRtUrl = true; break;
-            case 1027: { long v = parseLong(optarg, "interval"); if (v < 1 || v > 86400) die("Interval must be 1..86400"); cfg.intervalSec = static_cast<int>(v); break; }
-            case 1028: { long v = parseLong(optarg, "URL timeout"); if (v < 1 || v > 300) die("URL timeout must be 1..300"); cfg.urlTimeoutSec = static_cast<int>(v); break; }
             case 1010: { long v = parseLong(optarg, "RT enable"); if (v < 0 || v > 1) die("RT enable must be 0 or 1"); cfg.rtEnable = static_cast<uint8_t>(v); cfg.hasRtEnable = true; break; }
             case 1011: { long v = parseLong(optarg, "RT A/B"); if (v < 0 || v > 1) die("RT A/B must be 0 or 1"); cfg.rtAb = static_cast<uint8_t>(v); cfg.hasRtAb = true; break; }
             case 1012: cfg.dps = optarg; cfg.hasDps = true; break;
@@ -514,6 +731,13 @@ Config parseArgs(int argc, char* argv[]) {
             case 1023: cfg.reset = true; break;
             case 1024: cfg.storeEeprom = true; break;
             case 1025: cfg.verify = false; break;
+            case 1026: cfg.daemonize = true; cfg.foreground = false; break;
+            case 1027: cfg.foreground = true; cfg.daemonize = false; break;
+            case 1028: cfg.pidfile = optarg; break;
+            case 1032: cfg.rtUrl = optarg; cfg.hasRtUrl = true; break;
+            case 1033: { long v = parseLong(optarg, "interval"); if (v < 1 || v > 86400) die("interval must be 1..86400"); cfg.interval = static_cast<int>(v); break; }
+            case 1034: { long v = parseLong(optarg, "url-timeout"); if (v < 1 || v > 300) die("url-timeout must be 1..300"); cfg.urlTimeout = static_cast<int>(v); break; }
+            case 1031: cfg.logfile = optarg; break;
             case 'q': cfg.quiet = true; break;
             case 'h': usage(argv[0]); std::exit(0);
             default: usage(argv[0]); std::exit(1);
@@ -527,11 +751,11 @@ Config parseArgs(int argc, char* argv[]) {
         std::size_t max = (cfg.encoder == EncoderType::Pira32) ? MAX_DPS_LENGTH_PIRA32 : MAX_DPS_LENGTH_MRDS;
         if (cfg.dps.size() > max) die("DPS text too long");
     }
-    if (!(cfg.hasPi || cfg.hasPs || cfg.hasPty || cfg.hasDi || cfg.hasMs || cfg.hasTp || cfg.hasTa ||
-          cfg.hasAf || cfg.clearAf || cfg.hasRt || cfg.hasRtUrl || cfg.hasRtEnable || cfg.hasRtAb ||
+    if (!(cfg.wantPtyList || cfg.hasPi || cfg.hasPs || cfg.hasPty || cfg.hasDi || cfg.hasMs || cfg.hasTp || cfg.hasTa ||
+          cfg.hasAf || cfg.clearAf || cfg.hasRt || cfg.hasRtEnable || cfg.hasRtAb ||
           cfg.hasDps || cfg.hasDpsMode || cfg.hasLabelPeriod || cfg.hasStaticPsPeriod ||
           cfg.hasScrollSpeed || cfg.clearDps || cfg.hasExtSync || cfg.hasPhase || cfg.wantStatus ||
-          cfg.rdsOn || cfg.rdsOff || cfg.reset || cfg.storeEeprom)) {
+          cfg.rdsOn || cfg.rdsOff || cfg.reset || cfg.storeEeprom || cfg.hasRtUrl)) {
         usage(argv[0]);
         std::exit(1);
     }
@@ -541,110 +765,6 @@ Config parseArgs(int argc, char* argv[]) {
     }
 
     return cfg;
-}
-
-
-void verifyReg(I2CDevice& dev, uint8_t reg, uint8_t expected, bool verify, bool quiet);
-void verifyBlock(I2CDevice& dev, uint8_t startReg, const std::vector<uint8_t>& expected, bool verify, bool quiet);
-
-size_t curlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
-    auto* out = static_cast<std::string*>(userdata);
-    out->append(ptr, size * nmemb);
-    return size * nmemb;
-}
-
-std::string normalizeRadiotext(std::string s) {
-    for (char& ch : s) {
-        unsigned char u = static_cast<unsigned char>(ch);
-        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
-        else if (u < 32) ch = ' ';
-    }
-    std::string out;
-    out.reserve(s.size());
-    bool prevSpace = false;
-    for (char ch : s) {
-        if (ch == ' ') {
-            if (!prevSpace) out.push_back(ch);
-            prevSpace = true;
-        } else {
-            out.push_back(ch);
-            prevSpace = false;
-        }
-    }
-    out = trim(out);
-    if (out.size() > MAX_RT_LENGTH) out.resize(MAX_RT_LENGTH);
-    return out;
-}
-
-std::string fetchUrlText(const std::string& url, int timeoutSec) {
-    CURL* curl = curl_easy_init();
-    if (!curl) die("curl_easy_init failed");
-
-    std::string body;
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, static_cast<long>(timeoutSec));
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, static_cast<long>(timeoutSec));
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "rds_control/1.0");
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-
-    CURLcode rc = curl_easy_perform(curl);
-    if (rc != CURLE_OK) {
-        std::string msg = curl_easy_strerror(rc);
-        curl_easy_cleanup(curl);
-        die("HTTP fetch failed for " + url + ": " + msg);
-    }
-
-    curl_easy_cleanup(curl);
-    return normalizeRadiotext(body);
-}
-
-void writeMrdsRt(I2CDevice& dev, const Config& cfg, const std::string& rtText, bool enableRt, bool* abState = nullptr) {
-    if (enableRt || abState != nullptr) {
-        uint8_t reg = dev.readRegister(REG_RTEN);
-        if (enableRt) reg |= 0x01;
-        if (abState != nullptr) {
-            if (*abState) reg |= 0x02;
-            else reg &= ~uint8_t{0x02};
-        }
-        dev.writeRegister(REG_RTEN, reg);
-        verifyReg(dev, REG_RTEN, reg, cfg.verify, cfg.quiet);
-    }
-
-    std::string padded = padOrTrim(rtText, MAX_RT_LENGTH);
-    std::vector<uint8_t> bytes(padded.begin(), padded.end());
-    dev.writeBlock(REG_RT_START, bytes);
-    verifyBlock(dev, REG_RT_START, bytes, cfg.verify, cfg.quiet);
-}
-
-void pollRtUrlMrds(I2CDevice& dev, const Config& cfg) {
-    bool ab = cfg.hasRtAb ? (cfg.rtAb != 0) : false;
-    std::string lastSent;
-
-    if (!cfg.quiet) {
-        std::cout << "Starting RT URL polling: " << cfg.rtUrl
-                  << " (interval " << cfg.intervalSec << "s)\n";
-    }
-
-    while (true) {
-        try {
-            std::string text = fetchUrlText(cfg.rtUrl, cfg.urlTimeoutSec);
-            if (!text.empty() && text != lastSent) {
-                writeMrdsRt(dev, cfg, text, true, &ab);
-                if (!cfg.quiet) {
-                    std::cout << "RT update: [" << text << "] AB=" << (ab ? 1 : 0) << "\n";
-                }
-                lastSent = text;
-                ab = !ab;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "RT URL poll warning: " << e.what() << "\n";
-        }
-        sleep(cfg.intervalSec);
-    }
 }
 
 void verifyReg(I2CDevice& dev, uint8_t reg, uint8_t expected, bool verify, bool quiet) {
@@ -775,40 +895,144 @@ private:
 };
 
 
-void writePiraRt(Pira32Protocol& p, const Config& cfg, const std::string& rtText, bool enableRt) {
-    if (enableRt) {
-        p.command("RT1EN=1");
-        p.verifyValue("RT1EN", "1", cfg.verify);
-    }
-    p.command("RT1=" + rtText);
-    p.verifyValue("RT1", rtText, cfg.verify);
+size_t curlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
+    auto* out = static_cast<std::string*>(userdata);
+    out->append(ptr, size * nmemb);
+    return size * nmemb;
 }
 
-void pollRtUrlPira(Pira32Protocol& p, const Config& cfg) {
-    std::string lastSent;
-
-    if (!cfg.quiet) {
-        std::cout << "Starting RT URL polling: " << cfg.rtUrl
-                  << " (interval " << cfg.intervalSec << "s)\n";
+std::string normalizeRtText(std::string s) {
+    for (char& ch : s) {
+        if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
     }
-
-    while (true) {
-        try {
-            std::string text = fetchUrlText(cfg.rtUrl, cfg.urlTimeoutSec);
-            if (!text.empty() && text != lastSent) {
-                writePiraRt(p, cfg, text, true);
-                if (!cfg.quiet) {
-                    std::cout << "RT update: [" << text << "]\n";
-                }
-                lastSent = text;
-            }
-        } catch (const std::exception& e) {
-            std::cerr << "RT URL poll warning: " << e.what() << "\n";
+    std::string out;
+    out.reserve(s.size());
+    bool prevSpace = false;
+    for (unsigned char ch : s) {
+        bool isSpace = std::isspace(ch);
+        if (isSpace) {
+            if (!prevSpace) out.push_back(' ');
+        } else {
+            out.push_back(static_cast<char>(ch));
         }
-        sleep(cfg.intervalSec);
+        prevSpace = isSpace;
+    }
+    out = trim(out);
+    if (out.size() > MAX_RT_LENGTH) out.resize(MAX_RT_LENGTH);
+    return out;
+}
+
+std::string fetchUrlText(const std::string& url, int timeoutSec) {
+    CURL* curl = curl_easy_init();
+    if (!curl) die("curl_easy_init failed");
+    std::string body;
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, timeoutSec);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT, timeoutSec);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "rds_control/1.0");
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curlWriteCallback);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+    CURLcode rc = curl_easy_perform(curl);
+    long code = 0;
+    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+    curl_easy_cleanup(curl);
+    if (rc != CURLE_OK) {
+        die(std::string("HTTP fetch failed: ") + curl_easy_strerror(rc));
+    }
+    if (code < 200 || code >= 300) {
+        die("HTTP fetch failed with status " + std::to_string(code));
+    }
+    return normalizeRtText(body);
+}
+
+void sleepInterruptible(int seconds) {
+    for (int i = 0; i < seconds && !g_stopRequested; ++i) {
+        ::sleep(1);
     }
 }
 
+void writeMrdsRtText(I2CDevice& dev, const std::string& rt, bool verify, bool quiet) {
+    uint8_t rten = dev.readRegister(REG_RTEN);
+    rten |= 0x01;
+    rten ^= 0x02; // toggle A/B on each change
+    dev.writeRegister(REG_RTEN, rten);
+    verifyReg(dev, REG_RTEN, rten, verify, quiet);
+
+    std::string padded = padOrTrim(rt, MAX_RT_LENGTH);
+    std::vector<uint8_t> bytes(padded.begin(), padded.end());
+    dev.writeBlock(REG_RT_START, bytes);
+    verifyBlock(dev, REG_RT_START, bytes, verify, quiet);
+}
+
+void writePira32RtText(Pira32Protocol& p, const std::string& rt, bool verify) {
+    p.command("RT1EN=1");
+    p.verifyValue("RT1EN", "1", verify);
+    p.command("RT1=" + rt);
+    p.verifyValue("RT1", rt, verify);
+}
+
+void runRtUrlLoop(const Config& cfg) {
+    if (!cfg.quiet) {
+        std::cout << "RT URL mode\n"
+                  << "URL:      " << cfg.rtUrl << "\n"
+                  << "Interval: " << cfg.interval << " s\n"
+                  << "Timeout:  " << cfg.urlTimeout << " s\n\n";
+    }
+
+    std::string lastRt;
+    bool first = true;
+
+    if (cfg.encoder == EncoderType::Mrds1322) {
+        I2CDevice dev(cfg.bus, cfg.addr);
+        if (cfg.rdsOn) {
+            dev.sendControl(0x31);
+        }
+        while (!g_stopRequested) {
+            try {
+                std::string rt = fetchUrlText(cfg.rtUrl, cfg.urlTimeout);
+                if (!rt.empty() && (first || rt != lastRt)) {
+                    writeMrdsRtText(dev, rt, cfg.verify, cfg.quiet);
+                    if (!cfg.quiet) {
+                        std::cout << "[" << std::time(nullptr) << "] RT update: " << rt << "\n";
+                    }
+                    lastRt = rt;
+                    first = false;
+                }
+            } catch (const std::exception& e) {
+                if (!cfg.quiet) {
+                    std::cerr << "RT fetch/update error: " << e.what() << "\n";
+                }
+            }
+            sleepInterruptible(cfg.interval);
+        }
+    } else {
+        Pira32Protocol p(cfg.serialDevice, cfg.serialBaud, cfg.quiet);
+        if (cfg.rdsOn) {
+            p.command("RDSGEN=1");
+            p.verifyValue("RDSGEN", "1", cfg.verify);
+        }
+        while (!g_stopRequested) {
+            try {
+                std::string rt = fetchUrlText(cfg.rtUrl, cfg.urlTimeout);
+                if (!rt.empty() && (first || rt != lastRt)) {
+                    writePira32RtText(p, rt, cfg.verify);
+                    if (!cfg.quiet) {
+                        std::cout << "[" << std::time(nullptr) << "] RT update: " << rt << "\n";
+                    }
+                    lastRt = rt;
+                    first = false;
+                }
+            } catch (const std::exception& e) {
+                if (!cfg.quiet) {
+                    std::cerr << "RT fetch/update error: " << e.what() << "\n";
+                }
+            }
+            sleepInterruptible(cfg.interval);
+        }
+    }
+}
 
 void runMrds1322(const Config& cfg) {
     I2CDevice dev(cfg.bus, cfg.addr);
@@ -860,7 +1084,10 @@ void runMrds1322(const Config& cfg) {
     setBitfieldRtEn(dev, cfg);
 
     if (cfg.hasRt) {
-        writeMrdsRt(dev, cfg, cfg.rt, false);
+        std::string padded = padOrTrim(cfg.rt, MAX_RT_LENGTH);
+        std::vector<uint8_t> bytes(padded.begin(), padded.end());
+        dev.writeBlock(REG_RT_START, bytes);
+        verifyBlock(dev, REG_RT_START, bytes, cfg.verify, cfg.quiet);
     }
 
     if (cfg.clearDps) {
@@ -912,9 +1139,6 @@ void runMrds1322(const Config& cfg) {
     if (cfg.wantStatus) {
         uint8_t s = dev.readRegister(REG_STATUS);
         printMrdsStatus(s);
-    }
-    if (cfg.hasRtUrl) {
-        pollRtUrlMrds(dev, cfg);
     }
 }
 
@@ -976,7 +1200,8 @@ void runPira32(const Config& cfg) {
         }
     }
     if (cfg.hasRt) {
-        writePiraRt(p, cfg, cfg.rt, false);
+        p.command("RT1=" + cfg.rt);
+        p.verifyValue("RT1", cfg.rt, cfg.verify);
     }
     if (cfg.hasRtEnable) {
         std::string v = std::to_string(static_cast<int>(cfg.rtEnable));
@@ -1041,23 +1266,32 @@ void runPira32(const Config& cfg) {
         std::string status = p.queryValue("STATUS");
         std::cout << status << "\n";
     }
-    if (cfg.hasRtUrl) {
-        pollRtUrlPira(p, cfg);
-    }
 }
 
 } // namespace
 
 int main(int argc, char* argv[]) {
-    curl_global_init(CURL_GLOBAL_DEFAULT);
     try {
+        curl_global_init(CURL_GLOBAL_DEFAULT);
         Config cfg = parseArgs(argc, argv);
-        if (cfg.encoder == EncoderType::Mrds1322) {
+        if (cfg.daemonize) {
+            daemonizeProcess(cfg.pidfile, cfg.logfile);
+        } else {
+            installSignalHandlers();
+        }
+        if (cfg.wantPtyList) {
+            printPtyList();
+            return 0;
+        }
+        if (cfg.hasRtUrl) {
+            runRtUrlLoop(cfg);
+        } else if (cfg.encoder == EncoderType::Mrds1322) {
             runMrds1322(cfg);
         } else {
             runPira32(cfg);
         }
-        if (!cfg.quiet) std::cout << "Done\n";
+        if (g_stopRequested && !cfg.quiet) std::cout << "Stopped by signal\n";
+        else if (!cfg.quiet) std::cout << "Done\n";
         curl_global_cleanup();
         return 0;
     } catch (const std::exception& e) {
