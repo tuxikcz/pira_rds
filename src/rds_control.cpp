@@ -1,3 +1,4 @@
+
 #include <array>
 #include <cerrno>
 #include <cctype>
@@ -901,7 +902,67 @@ size_t curlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
+std::string decodeHtmlEntities(std::string s) {
+    const std::array<std::pair<const char*, const char*>, 12> named = {{
+        {"&amp;", "&"},
+        {"&lt;", "<"},
+        {"&gt;", ">"},
+        {"&quot;", "\""},
+        {"&apos;", "'"},
+        {"&#039;", "'"},
+        {"&#39;", "'"},
+        {"&nbsp;", " "},
+        {"&ndash;", "-"},
+        {"&mdash;", "-"},
+        {"&hellip;", "..."},
+        {"&rsquo;", "'"}
+    }};
+
+    for (const auto& item : named) {
+        std::size_t pos = 0;
+        while ((pos = s.find(item.first, pos)) != std::string::npos) {
+            s.replace(pos, std::strlen(item.first), item.second);
+            pos += std::strlen(item.second);
+        }
+    }
+
+    std::string out;
+    out.reserve(s.size());
+    for (std::size_t i = 0; i < s.size(); ++i) {
+        if (s[i] == '&' && i + 3 < s.size() && s[i + 1] == '#') {
+            std::size_t j = i + 2;
+            int base = 10;
+            if (j < s.size() && (s[j] == 'x' || s[j] == 'X')) {
+                base = 16;
+                ++j;
+            }
+            std::size_t numStart = j;
+            while (j < s.size() && std::isxdigit(static_cast<unsigned char>(s[j]))) ++j;
+            if (j < s.size() && s[j] == ';' && j > numStart) {
+                unsigned long code = 0;
+                try {
+                    code = std::stoul(s.substr(numStart, j - numStart), nullptr, base);
+                } catch (...) {
+                    code = 0;
+                }
+                if (code >= 32 && code <= 126) {
+                    out.push_back(static_cast<char>(code));
+                } else if (code == 160) {
+                    out.push_back(' ');
+                } else {
+                    out.push_back(' ');
+                }
+                i = j;
+                continue;
+            }
+        }
+        out.push_back(s[i]);
+    }
+    return out;
+}
+
 std::string normalizeRtText(std::string s) {
+    s = decodeHtmlEntities(std::move(s));
     for (char& ch : s) {
         if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
     }
