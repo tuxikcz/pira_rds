@@ -505,6 +505,135 @@ private:
     int fd_{-1};
 };
 
+
+bool isValidDateString(const std::string& s) {
+    if (s.size() != 8 || s[2] != '.' || s[5] != '.') return false;
+    if (!std::isdigit(static_cast<unsigned char>(s[0])) || !std::isdigit(static_cast<unsigned char>(s[1])) ||
+        !std::isdigit(static_cast<unsigned char>(s[3])) || !std::isdigit(static_cast<unsigned char>(s[4])) ||
+        !std::isdigit(static_cast<unsigned char>(s[6])) || !std::isdigit(static_cast<unsigned char>(s[7]))) {
+        return false;
+    }
+    int day = std::stoi(s.substr(0, 2));
+    int month = std::stoi(s.substr(3, 2));
+    return day >= 1 && day <= 31 && month >= 1 && month <= 12;
+}
+
+bool isValidTimeString(const std::string& s) {
+    if (s.size() != 5 && s.size() != 8) return false;
+    auto is2d = [](char a, char b) {
+        return std::isdigit(static_cast<unsigned char>(a)) && std::isdigit(static_cast<unsigned char>(b));
+    };
+    if (!is2d(s[0], s[1]) || s[2] != ':' || !is2d(s[3], s[4])) return false;
+    int hh = std::stoi(s.substr(0, 2));
+    int mm = std::stoi(s.substr(3, 2));
+    int ss = 0;
+    if (s.size() == 8) {
+        if (s[5] != ':' || !is2d(s[6], s[7])) return false;
+        ss = std::stoi(s.substr(6, 2));
+    }
+    return hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59 && ss >= 0 && ss <= 59;
+}
+
+
+
+std::string decodeHtmlEntities(const std::string& input) {
+    std::string out;
+    out.reserve(input.size());
+
+    auto appendCodepoint = [&](unsigned int code) {
+        if (code == 0) return;
+        if (code <= 0x7F) {
+            out.push_back(static_cast<char>(code));
+        } else if (code <= 0x7FF) {
+            out.push_back(static_cast<char>(0xC0 | ((code >> 6) & 0x1F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        } else if (code <= 0xFFFF) {
+            out.push_back(static_cast<char>(0xE0 | ((code >> 12) & 0x0F)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        } else if (code <= 0x10FFFF) {
+            out.push_back(static_cast<char>(0xF0 | ((code >> 18) & 0x07)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 12) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | ((code >> 6) & 0x3F)));
+            out.push_back(static_cast<char>(0x80 | (code & 0x3F)));
+        }
+    };
+
+    for (std::size_t i = 0; i < input.size(); ) {
+        if (input[i] != '&') {
+            out.push_back(input[i++]);
+            continue;
+        }
+
+        std::size_t semi = input.find(';', i + 1);
+        if (semi == std::string::npos || semi - i > 12) {
+            out.push_back(input[i++]);
+            continue;
+        }
+
+        std::string entity = input.substr(i, semi - i + 1);
+        std::string replacement;
+
+        if (entity == "&amp;") replacement = "&";
+        else if (entity == "&lt;") replacement = "<";
+        else if (entity == "&gt;") replacement = ">";
+        else if (entity == "&quot;") replacement = "\"";
+        else if (entity == "&apos;" || entity == "&#039;" || entity == "&#39;") replacement = "'";
+        else if (entity == "&nbsp;") replacement = " ";
+        else if (entity == "&ndash;" || entity == "&mdash;") replacement = "-";
+        else if (entity == "&hellip;") replacement = "...";
+        else if (entity.size() > 3 && entity[1] == '#') {
+            try {
+                unsigned int code = 0;
+                if (entity[2] == 'x' || entity[2] == 'X') {
+                    code = static_cast<unsigned int>(std::stoul(entity.substr(3, entity.size() - 4), nullptr, 16));
+                } else {
+                    code = static_cast<unsigned int>(std::stoul(entity.substr(2, entity.size() - 3), nullptr, 10));
+                }
+                std::string encoded;
+                auto old_size = out.size();
+                appendCodepoint(code);
+                if (out.size() > old_size) {
+                    i = semi + 1;
+                    continue;
+                }
+            } catch (...) {
+            }
+        }
+
+        if (!replacement.empty()) {
+            out += replacement;
+            i = semi + 1;
+        } else {
+            out.push_back(input[i++]);
+        }
+    }
+
+    return out;
+}
+
+bool fillSystemClockStrings(std::string& outDate, std::string& outTime) {
+    std::time_t now = std::time(nullptr);
+    std::tm localTm{};
+#if defined(_POSIX_VERSION)
+    if (localtime_r(&now, &localTm) == nullptr) {
+        return false;
+    }
+#else
+    std::tm* tmp = std::localtime(&now);
+    if (tmp == nullptr) {
+        return false;
+    }
+    localTm = *tmp;
+#endif
+    char dateBuf[16];
+    char timeBuf[16];
+    if (std::strftime(dateBuf, sizeof(dateBuf), "%d.%m.%y", &localTm) == 0) return false;
+    if (std::strftime(timeBuf, sizeof(timeBuf), "%H:%M:%S", &localTm) == 0) return false;
+    outDate = dateBuf;
+    outTime = timeBuf;
+    return true;
+}
 struct Config {
     EncoderType encoder = EncoderType::Mrds1322;
 
@@ -533,6 +662,12 @@ struct Config {
     bool hasMs = false;      uint8_t ms = 0;
     bool hasTp = false;      uint8_t tp = 0;
     bool hasTa = false;      uint8_t ta = 0;
+    bool hasTps = false;     std::string tps;
+    bool clearTps = false;
+    bool hasCt = false;      uint8_t ct = 0;
+    bool hasDate = false;    std::string date;
+    bool hasTime = false;    std::string time;
+    bool syncClock = false;
     bool hasAf = false;      std::vector<uint8_t> af;
     bool clearAf = false;
     bool hasRt = false;      std::string rt;
@@ -574,6 +709,12 @@ void usage(const char* prog) {
         << "  --ms 0|1            Music/Speech\n"
         << "  --tp 0|1            Traffic Program\n"
         << "  --ta 0|1            Traffic Announcement\n"
+        << "  --tps TEXT          Traffic PS, max 8 chars (PIRA32 only)\n"
+        << "  --clear-tps         Disable Traffic PS (PIRA32 only)\n"
+        << "  --ct 0|1            Enable/disable CT time/date transmission (PIRA32 only)\n"
+        << "  --date DD.MM.YY     Set local date for CT/RTC (PIRA32 only)\n"
+        << "  --time HH:MM[:SS]   Set local time for CT/RTC (PIRA32 only)\n"
+        << "  --sync-clock        Set DATE and TIME from local system clock (PIRA32 only)\n"
         << "  --af LIST           AF list, comma-separated MHz or raw codes\n"
         << "  --clear-af          Clear AF list\n"
         << "  --rt TEXT           Radiotext (MRDS1322 max 64, PIRA32 RT1 max 64)\n"
@@ -625,6 +766,12 @@ Config parseArgs(int argc, char* argv[]) {
         {"ms", required_argument, nullptr, 1004},
         {"tp", required_argument, nullptr, 1005},
         {"ta", required_argument, nullptr, 1006},
+        {"tps", required_argument, nullptr, 1035},
+        {"clear-tps", no_argument, nullptr, 1036},
+        {"ct", required_argument, nullptr, 1037},
+        {"date", required_argument, nullptr, 1038},
+        {"time", required_argument, nullptr, 1039},
+        {"sync-clock", no_argument, nullptr, 1040},
         {"af", required_argument, nullptr, 1007},
         {"clear-af", no_argument, nullptr, 1008},
         {"rt", required_argument, nullptr, 1009},
@@ -708,6 +855,12 @@ Config parseArgs(int argc, char* argv[]) {
             case 1004: { long v = parseLong(optarg, "MS"); if (v < 0 || v > 1) die("MS must be 0 or 1"); cfg.ms = static_cast<uint8_t>(v); cfg.hasMs = true; break; }
             case 1005: { long v = parseLong(optarg, "TP"); if (v < 0 || v > 1) die("TP must be 0 or 1"); cfg.tp = static_cast<uint8_t>(v); cfg.hasTp = true; break; }
             case 1006: { long v = parseLong(optarg, "TA"); if (v < 0 || v > 1) die("TA must be 0 or 1"); cfg.ta = static_cast<uint8_t>(v); cfg.hasTa = true; break; }
+            case 1035: cfg.tps = padOrTrim(optarg, MAX_PS_LENGTH); cfg.hasTps = true; break;
+            case 1036: cfg.clearTps = true; break;
+            case 1037: { long v = parseLong(optarg, "CT"); if (v < 0 || v > 1) die("CT must be 0 or 1"); cfg.ct = static_cast<uint8_t>(v); cfg.hasCt = true; break; }
+            case 1038: { std::string v = trim(optarg); if (!isValidDateString(v)) die("DATE must be in DD.MM.YY format"); cfg.date = v; cfg.hasDate = true; break; }
+            case 1039: { std::string v = trim(optarg); if (!isValidTimeString(v)) die("TIME must be in HH:MM or HH:MM:SS format"); cfg.time = v; cfg.hasTime = true; break; }
+            case 1040: cfg.syncClock = true; break;
             case 1007: {
                 std::size_t maxItems = (cfg.encoder == EncoderType::Pira32) ? MAX_AF_ITEMS_PIRA32 : MAX_AF_ITEMS_MRDS;
                 cfg.af = parseAfCodes(optarg, maxItems);
@@ -745,6 +898,20 @@ Config parseArgs(int argc, char* argv[]) {
         }
     }
 
+    if (cfg.syncClock) {
+        if (cfg.encoder != EncoderType::Pira32) {
+            die("--sync-clock is supported only for PIRA32");
+        }
+        if (cfg.hasDate || cfg.hasTime) {
+            die("--sync-clock cannot be combined with --date or --time");
+        }
+        if (!fillSystemClockStrings(cfg.date, cfg.time)) {
+            die("Failed to read local system clock");
+        }
+        cfg.hasDate = true;
+        cfg.hasTime = true;
+    }
+
     if (cfg.hasRt && cfg.rt.size() > MAX_RT_LENGTH) {
         die("RT length must be <= 64");
     }
@@ -753,6 +920,7 @@ Config parseArgs(int argc, char* argv[]) {
         if (cfg.dps.size() > max) die("DPS text too long");
     }
     if (!(cfg.wantPtyList || cfg.hasPi || cfg.hasPs || cfg.hasPty || cfg.hasDi || cfg.hasMs || cfg.hasTp || cfg.hasTa ||
+          cfg.hasTps || cfg.clearTps || cfg.hasCt || cfg.hasDate || cfg.hasTime || cfg.syncClock ||
           cfg.hasAf || cfg.clearAf || cfg.hasRt || cfg.hasRtEnable || cfg.hasRtAb ||
           cfg.hasDps || cfg.hasDpsMode || cfg.hasLabelPeriod || cfg.hasStaticPsPeriod ||
           cfg.hasScrollSpeed || cfg.clearDps || cfg.hasExtSync || cfg.hasPhase || cfg.wantStatus ||
@@ -763,6 +931,9 @@ Config parseArgs(int argc, char* argv[]) {
 
     if (cfg.encoder == EncoderType::Pira32 && cfg.hasRtAb) {
         die("--rt-ab is supported only for MRDS1322; PIRA32 handles RT A/B via RTTYPE/RT updates");
+    }
+    if (cfg.encoder == EncoderType::Mrds1322 && (cfg.hasTps || cfg.clearTps || cfg.hasCt || cfg.hasDate || cfg.hasTime || cfg.syncClock)) {
+        die("--tps/--clear-tps/--ct/--date/--time/--sync-clock are supported only for PIRA32");
     }
 
     return cfg;
@@ -882,8 +1053,16 @@ public:
     void verifyValue(const std::string& queryCmd, const std::string& expected, bool verify) {
         if (!verify) return;
         std::string got = trim(queryValue(queryCmd));
-        if (trim(expected) != got) {
-            die("Verify failed for " + queryCmd + ": expected [" + trim(expected) + "], got [" + got + "]");
+        std::string exp = trim(expected);
+        bool ok = (exp == got);
+
+        // PIRA32 TIME readback may omit seconds and return HH:MM even if HH:MM:SS was written.
+        if (!ok && queryCmd == "TIME" && exp.size() >= 5 && got.size() == 5) {
+            ok = (exp.substr(0, 5) == got);
+        }
+
+        if (!ok) {
+            die("Verify failed for " + queryCmd + ": expected [" + exp + "], got [" + got + "]");
         }
         if (!quiet_) {
             std::cout << "Verified " << queryCmd << " = [" << got << "]\n";
@@ -902,67 +1081,7 @@ size_t curlWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata) {
     return size * nmemb;
 }
 
-std::string decodeHtmlEntities(std::string s) {
-    const std::array<std::pair<const char*, const char*>, 12> named = {{
-        {"&amp;", "&"},
-        {"&lt;", "<"},
-        {"&gt;", ">"},
-        {"&quot;", "\""},
-        {"&apos;", "'"},
-        {"&#039;", "'"},
-        {"&#39;", "'"},
-        {"&nbsp;", " "},
-        {"&ndash;", "-"},
-        {"&mdash;", "-"},
-        {"&hellip;", "..."},
-        {"&rsquo;", "'"}
-    }};
-
-    for (const auto& item : named) {
-        std::size_t pos = 0;
-        while ((pos = s.find(item.first, pos)) != std::string::npos) {
-            s.replace(pos, std::strlen(item.first), item.second);
-            pos += std::strlen(item.second);
-        }
-    }
-
-    std::string out;
-    out.reserve(s.size());
-    for (std::size_t i = 0; i < s.size(); ++i) {
-        if (s[i] == '&' && i + 3 < s.size() && s[i + 1] == '#') {
-            std::size_t j = i + 2;
-            int base = 10;
-            if (j < s.size() && (s[j] == 'x' || s[j] == 'X')) {
-                base = 16;
-                ++j;
-            }
-            std::size_t numStart = j;
-            while (j < s.size() && std::isxdigit(static_cast<unsigned char>(s[j]))) ++j;
-            if (j < s.size() && s[j] == ';' && j > numStart) {
-                unsigned long code = 0;
-                try {
-                    code = std::stoul(s.substr(numStart, j - numStart), nullptr, base);
-                } catch (...) {
-                    code = 0;
-                }
-                if (code >= 32 && code <= 126) {
-                    out.push_back(static_cast<char>(code));
-                } else if (code == 160) {
-                    out.push_back(' ');
-                } else {
-                    out.push_back(' ');
-                }
-                i = j;
-                continue;
-            }
-        }
-        out.push_back(s[i]);
-    }
-    return out;
-}
-
 std::string normalizeRtText(std::string s) {
-    s = decodeHtmlEntities(std::move(s));
     for (char& ch : s) {
         if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
     }
@@ -1005,7 +1124,7 @@ std::string fetchUrlText(const std::string& url, int timeoutSec) {
     if (code < 200 || code >= 300) {
         die("HTTP fetch failed with status " + std::to_string(code));
     }
-    return normalizeRtText(body);
+    return normalizeRtText(decodeHtmlEntities(body));
 }
 
 void sleepInterruptible(int seconds) {
@@ -1247,6 +1366,35 @@ void runPira32(const Config& cfg) {
         std::string v = std::to_string(static_cast<int>(cfg.ta));
         p.command("TA=" + v);
         p.verifyValue("TA", v, cfg.verify);
+    }
+    if (cfg.hasTps) {
+        std::string v = trim(cfg.tps);
+        p.command("TPS=" + v, 450);
+        p.verifyValue("TPS", v, cfg.verify);
+    }
+    if (cfg.clearTps) {
+        p.command("TPS=", 450);
+        if (!cfg.quiet && cfg.verify) {
+            std::cout << "TPS cleared; strict empty-string verify skipped.\n";
+        }
+    }
+    if (cfg.hasCt) {
+        std::string v = std::to_string(static_cast<int>(cfg.ct));
+        p.command("CT=" + v);
+        p.verifyValue("CT", v, cfg.verify);
+    }
+    if (cfg.syncClock && !cfg.quiet) {
+        std::cout << "Sync clock from local system time: DATE=" << cfg.date << " TIME=" << cfg.time << "\n";
+    }
+    if (cfg.hasDate) {
+        p.command("DATE=" + cfg.date);
+        if (!cfg.quiet && cfg.verify) {
+            std::cout << "DATE written; strict readback skipped because the manual marks DATE query as not implemented.\n";
+        }
+    }
+    if (cfg.hasTime) {
+        p.command("TIME=" + cfg.time);
+        p.verifyValue("TIME", cfg.time, cfg.verify);
     }
     if (cfg.clearAf) {
         p.command("AF=");
