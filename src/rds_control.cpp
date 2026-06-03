@@ -582,6 +582,7 @@ std::string decodeHtmlEntities(const std::string& input) {
         else if (entity == "&nbsp;") replacement = " ";
         else if (entity == "&ndash;" || entity == "&mdash;") replacement = "-";
         else if (entity == "&hellip;") replacement = "...";
+        else if (entity == "&#39;") replacement = "'";
         else if (entity.size() > 3 && entity[1] == '#') {
             try {
                 unsigned int code = 0;
